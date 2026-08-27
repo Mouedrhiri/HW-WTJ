@@ -73,18 +73,18 @@ function countdown(ms) {
 //  MENU
 // ════════════════════════════════════════════════════════════════
 async function mainMenu() {
-  header('JobBot -- Candidature automatique (boucle 30 min)');
-  console.log('  [1]  Welcome to the Jungle');
-  console.log('  [2]  HelloWork');
-  console.log('  [3]  Les deux\n');
+  header('JobBot -- HelloWork (boucle 30 min)');
 
-  let choice = '';
-  while (!['1','2','3'].includes(choice)) choice = await ask('  Votre choix (1/2/3) : ');
+  // WTTJ temporairement desactive. Remettre le menu 1/2/3 pour le reactiver.
+  const choice = '2';
+  log('INFO', 'Mode HelloWork uniquement (WTTJ desactive)');
 
-  let phone = '', jobKeyword = '', jobLocation = '';
+  let firstName = '', lastName = '', phone = '', jobKeyword = '', jobLocation = '';
   if (['2','3'].includes(choice)) {
     jobKeyword  = await ask('\n  Metier (ex: Alternance Informatique) : ');
     jobLocation = await ask('  Lieu (ex: France) : ');
+    firstName   = await ask('  Prenom : ');
+    lastName    = await ask('  Nom : ');
     phone       = await ask('  Telephone : ');
   }
 
@@ -94,7 +94,7 @@ async function mainMenu() {
     else { log('OK', `${loadSeen().size} offres en memoire`); }
   }
 
-  return { choice, phone, jobKeyword, jobLocation };
+  return { choice, profile: { firstName, lastName, phone }, jobKeyword, jobLocation };
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -196,24 +196,93 @@ async function applyHWFilters(page) {
   log('FILTRE', 'Filtres ignores -- collecte directe des offres');
 }
 
+// Reconnait les champs meme si HelloWork change leur name/id. Le texte du label,
+// le placeholder, aria-label et autocomplete sont tous pris en compte.
+async function fillHWPersonalFields(page, profile) {
+  const inputs = page.locator('input');
+  const count = await inputs.count();
+  const filled = new Set();
+
+  for (let i = 0; i < count; i++) {
+    const input = inputs.nth(i);
+    if (!await input.isVisible().catch(() => false)) continue;
+
+    const meta = await input.evaluate(el => {
+      const id = el.getAttribute('id') || '';
+      const explicitLabel = id
+        ? [...document.querySelectorAll('label')].find(label => label.htmlFor === id)?.innerText || ''
+        : '';
+      return {
+        type: (el.getAttribute('type') || 'text').toLowerCase(),
+        disabled: el.disabled,
+        readOnly: el.readOnly,
+        text: [
+          el.getAttribute('name'), id, el.getAttribute('placeholder'),
+          el.getAttribute('aria-label'), el.getAttribute('autocomplete'),
+          explicitLabel, el.closest('label')?.innerText,
+          el.parentElement?.innerText?.substring(0, 120),
+        ].filter(Boolean).join(' '),
+      };
+    }).catch(() => null);
+
+    if (!meta || meta.disabled || meta.readOnly ||
+        ['hidden', 'email', 'file', 'checkbox', 'radio', 'submit', 'button'].includes(meta.type)) continue;
+
+    const description = meta.text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    let kind = '';
+    if (meta.type === 'tel' || /telephone|phone|mobile|portable|tel\b/.test(description)) {
+      kind = 'phone';
+    } else if (/prenom|first[ _-]?name|given[ _-]?name/.test(description)) {
+      kind = 'firstName';
+    } else if (/nom de famille|last[ _-]?name|family[ _-]?name|surname/.test(description) ||
+               /(^|[ _-])nom($|[ _-])/.test(description)) {
+      kind = 'lastName';
+    }
+
+    const value = kind ? profile[kind] : '';
+    if (!value) continue;
+    const existing = await input.inputValue().catch(() => '');
+    if (existing.trim()) continue;
+
+    await input.fill(value);
+    filled.add(kind);
+  }
+
+  const labels = { firstName: 'Prenom', lastName: 'Nom', phone: 'Telephone' };
+  for (const kind of filled) log('OK', `${labels[kind]} renseigne`);
+  return filled;
+}
+
+async function isHWApplicationConfirmed(page) {
+  return page.evaluate(() => {
+    const txt = (document.body.innerText || '').normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    const url = window.location.href.toLowerCase();
+    return /candidature (a bien ete |est )?envoyee|candidature recue|merci pour votre candidature/.test(txt) ||
+           url.includes('confirm') || url.includes('success') || url.includes('merci') ||
+           !!document.querySelector('[data-cy="applicationSent"],[data-cy="successMessage"]');
+  });
+}
+
 // ════════════════════════════════════════════════════════════════
 //  HELLOWORK — CYCLE
 // ════════════════════════════════════════════════════════════════
-async function runHelloWork(page, jobKeyword, jobLocation, phone, seen, cycleNum) {
+async function runHelloWork(page, jobKeyword, jobLocation, profile, seen, cycleNum) {
   header(`HelloWork -- Cycle #${cycleNum} [${timestamp()}]`);
 
-  // Navigation directe avec parametres dans l'URL
+  // La liste utilise une page separee. Une fiche d'offre locale ne peut donc
+  // jamais remplacer la recherche nationale ni influencer sa pagination.
   const searchUrl = `${HW_SEARCH}?k=${encodeURIComponent(jobKeyword)}&l=${encodeURIComponent(jobLocation)}`;
   log('NAV', `URL : ${searchUrl}`);
-  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await sleep(2000);
-
-  // Appliquer filtres
-  await applyHWFilters(page);
-
-  // Collecter URLs
-  log('OK', 'Collecte des offres...');
-  const allUrls = await hwCollectUrls(page, searchUrl);
+  const searchPage = await page.context().newPage();
+  let allUrls;
+  try {
+    await applyHWFilters(searchPage);
+    log('OK', 'Collecte des offres...');
+    allUrls = await hwCollectUrls(searchPage, searchUrl);
+  } finally {
+    await searchPage.close().catch(() => {});
+  }
   const newUrls = allUrls.filter(u => !seen.has(u));
   log('OK', `${allUrls.length} offre(s) total -- ${newUrls.length} nouvelle(s)`);
 
@@ -274,12 +343,8 @@ async function runHelloWork(page, jobKeyword, jobLocation, phone, seen, cycleNum
         log('SKIP', 'Formulaire non visible -- skip'); skipped++; continue;
       }
 
-      // Remplir telephone si present
-      const phoneField = page.locator('input[name*="phone"], input[name*="tel"], input[type="tel"]').first();
-      if (await phoneField.count() > 0) {
-        const existing = await phoneField.inputValue().catch(() => '');
-        if (!existing.trim() && phone) { await phoneField.fill(phone); log('OK', 'Telephone renseigne'); }
-      }
+      // Remplir les coordonnees demandees sur le premier ecran.
+      await fillHWPersonalFields(page, profile);
 
       // ── ETAPE 3 : Vrai clic Playwright sur submit ────────────────────────
       await submitLoc.click({ force: true, timeout: 5000 });
@@ -287,13 +352,7 @@ async function runHelloWork(page, jobKeyword, jobLocation, phone, seen, cycleNum
       await sleep(3000);
 
       // ── ETAPE 4 : Detection confirmation ─────────────────────────────────
-      const isConfirmed = await page.evaluate(() => {
-        const txt = (document.body.innerText || '').toLowerCase();
-        const url = window.location.href.toLowerCase();
-        return txt.includes('envoy') || txt.includes('merci') || txt.includes('confirm') ||
-               url.includes('confirm') || url.includes('success') || url.includes('merci') ||
-               !!document.querySelector('[data-cy="applicationSent"],[data-cy="successMessage"]');
-      });
+      const isConfirmed = await isHWApplicationConfirmed(page);
 
       if (isConfirmed) {
         log('ENVOYE', 'Candidature confirmee par HelloWork !');
@@ -301,14 +360,13 @@ async function runHelloWork(page, jobKeyword, jobLocation, phone, seen, cycleNum
         // Tenter un 2e ecran
         const submit2 = page.locator('button[data-cy="submitButton"]').first();
         if (await submit2.count() > 0 && await submit2.isVisible().catch(() => false)) {
+          // Certains formulaires demandent les coordonnees seulement au 2e ecran.
+          await fillHWPersonalFields(page, profile);
           await submit2.click({ force: true, timeout: 5000 });
           log('OK', 'Clic 2e submit');
           await sleep(3000);
         }
-        const isConfirmed2 = await page.evaluate(() => {
-          const txt = (document.body.innerText || '').toLowerCase();
-          return txt.includes('envoy') || txt.includes('merci') || txt.includes('confirm');
-        });
+        const isConfirmed2 = await isHWApplicationConfirmed(page);
         if (isConfirmed2) {
           log('ENVOYE', 'Candidature confirmee (2e etape) !');
         } else {
@@ -343,7 +401,9 @@ async function runHelloWork(page, jobKeyword, jobLocation, phone, seen, cycleNum
 async function hwCollectUrls(page, baseSearchUrl) {
   const allUrls = new Set();
   for (let p = 1; p <= 50; p++) {
-    const url = p === 1 ? baseSearchUrl : baseSearchUrl + '&page=' + p;
+    const urlObj = new URL(baseSearchUrl);
+    if (p > 1) urlObj.searchParams.set('p', String(p));
+    const url = urlObj.toString();
     log('NAV', 'Collecte page ' + p + ' : ' + url);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(2000);
@@ -451,7 +511,7 @@ async function wttjCollectUrls(page) {
 //  MAIN
 // ════════════════════════════════════════════════════════════════
 async function main() {
-  const { choice, phone, jobKeyword, jobLocation } = await mainMenu();
+  const { choice, profile, jobKeyword, jobLocation } = await mainMenu();
   const seen = loadSeen();
   log('OK', `Historique : ${seen.size} offre(s) en memoire\n`);
 
@@ -558,10 +618,11 @@ async function main() {
   let hwPage   = null;
 
   // ─── CONNEXIONS OBLIGATOIRES — DANS L'ORDRE, AVANT TOUT ─────
-  if (choice === '1' || choice === '3') {
-    wttjPage = await ctx.newPage();
-    await loginWTTJ(wttjPage);
-  }
+  // WTTJ temporairement desactive.
+  // if (choice === '1' || choice === '3') {
+  //   wttjPage = await ctx.newPage();
+  //   await loginWTTJ(wttjPage);
+  // }
 
   if (choice === '2' || choice === '3') {
     hwPage = await ctx.newPage();
@@ -575,8 +636,9 @@ async function main() {
 
   while (true) {
     try {
-      if (wttjPage) { const r = await runWTTJ(wttjPage, seen, cycle); grand.sent += r.sent; grand.skipped += r.skipped; }
-      if (hwPage)   { const r = await runHelloWork(hwPage, jobKeyword, jobLocation, phone, seen, cycle); grand.sent += r.sent; grand.skipped += r.skipped; }
+      // WTTJ temporairement desactive.
+      // if (wttjPage) { const r = await runWTTJ(wttjPage, seen, cycle); grand.sent += r.sent; grand.skipped += r.skipped; }
+      if (hwPage)   { const r = await runHelloWork(hwPage, jobKeyword, jobLocation, profile, seen, cycle); grand.sent += r.sent; grand.skipped += r.skipped; }
     } catch (err) {
       log('ERREUR', `Cycle #${cycle} : ${err.message}`);
       log('INFO', 'Reprise au prochain cycle...');
